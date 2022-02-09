@@ -1,0 +1,287 @@
+package common
+
+import (
+	"errors"
+	"github.com/go-log/log"
+	"github.com/xtaci/kcp-go"
+	"github.com/xtaci/smux"
+	"github.com/xtaci/tcpraw"
+	"net"
+	"sync"
+	"time"
+)
+
+
+type Transporter interface {
+	Dial(addr string) (net.Conn, error)
+	Handshake(conn net.Conn) (net.Conn, error)
+	// Indicate that the Transporter supports multiplex
+	Multiplex() bool
+}
+
+
+type kcpTransporter struct {
+	sessions     map[string]*muxSession
+	sessionMutex sync.Mutex
+
+}
+
+// KCPTransporter creates a Transporter that is used by KCP proxy client.
+func KCPTransporter() Transporter {
+	return &kcpTransporter{
+		sessions: make(map[string]*muxSession),
+	}
+}
+
+func dial1(addr string) (conn net.Conn, err error) {
+
+	cc, err := Dial(addr)
+	if err != nil {
+		panic(nil)
+		return
+	}
+
+	cn, err := Handshake(cc)
+	if err != nil {
+		panic(nil)
+		return
+	}
+
+	conn = cn
+	return
+}
+
+
+
+
+func (tr *kcpTransporter) Dial(addr string) (conn net.Conn, err error) {
+
+	tr.sessionMutex.Lock()
+	defer tr.sessionMutex.Unlock()
+
+	session, ok := tr.sessions[addr]
+	if session != nil && session.session != nil && session.session.IsClosed() {
+		session.Close()
+		delete(tr.sessions, addr) // session is dead
+		ok = false
+	}
+	if !ok {
+		raddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return nil, err
+		}
+
+			conn, err = net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, err
+			}
+
+		session = &muxSession{conn: conn}
+		tr.sessions[addr] = session
+	}
+	return session.conn, nil
+}
+
+func (tr *kcpTransporter) Handshake(conn net.Conn) (net.Conn, error) {
+
+	tr.sessionMutex.Lock()
+	defer tr.sessionMutex.Unlock()
+
+	session, ok := tr.sessions[opts.Addr]
+	if !ok || session.session == nil {
+		s, err := tr.initSession(opts.Addr, conn, config)
+		if err != nil {
+			conn.Close()
+			delete(tr.sessions, opts.Addr)
+			return nil, err
+		}
+		session = s
+		tr.sessions[opts.Addr] = session
+	}
+	cc, err := session.GetConn()
+	if err != nil {
+		session.Close()
+		delete(tr.sessions, opts.Addr)
+		return nil, err
+	}
+
+	return cc, nil
+}
+
+func (tr *kcpTransporter) initSession(addr string, conn net.Conn) (*muxSession, error) {
+	pc, ok := conn.(net.PacketConn)
+	if !ok {
+		return nil, errors.New("kcp: wrong connection type")
+	}
+
+	kcpconn, err := kcp.NewConn(addr, nil,10,3,pc)
+	if err != nil {
+		return nil, err
+	}
+
+	kcpconn.SetStreamMode(true)
+	kcpconn.SetWriteDelay(false)
+
+
+	// stream multiplex
+	smuxConfig := smux.DefaultConfig()
+
+	var cc net.Conn = kcpconn
+
+	session, err := smux.Client(cc, smuxConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &muxSession{conn: conn, session: session}, nil
+}
+
+func (tr *kcpTransporter) Multiplex() bool {
+	return true
+}
+
+
+//========================Listener ====================================================
+
+type kcpListener struct {
+	ln       *kcp.Listener
+	connChan chan net.Conn
+	errChan  chan error
+}
+
+// KCPListener creates a Listener for KCP proxy server.
+func KCPListener(ln *kcp.Listener) (*kcpListener, error) {
+
+	l := &kcpListener{
+		ln:       ln,
+		connChan: make(chan net.Conn, 1024),
+		errChan:  make(chan error, 1),
+	}
+	go l.listenLoop()
+	return l, nil
+}
+
+func (l *kcpListener) listenLoop() {
+	for {
+		conn, err := l.ln.AcceptKCP()
+		if err != nil {
+			log.Log("[kcp] accept:", err)
+			l.errChan <- err
+			close(l.errChan)
+			return
+		}
+		conn.SetStreamMode(true)
+		conn.SetWriteDelay(false)
+
+		go l.mux(conn)
+	}
+}
+
+func (l *kcpListener) mux(conn net.Conn) {
+	smuxConfig := smux.DefaultConfig()
+
+	log.Logf("[kcp] %s - %s", conn.RemoteAddr(), l.Addr())
+
+	mux, err := smux.Server(conn, smuxConfig)
+	if err != nil {
+		log.Log("[kcp]", err)
+		return
+	}
+	defer mux.Close()
+
+	log.Logf("[kcp] %s <-> %s", conn.RemoteAddr(), l.Addr())
+	defer log.Logf("[kcp] %s >-< %s", conn.RemoteAddr(), l.Addr())
+
+	for {
+		stream, err := mux.AcceptStream()
+		if err != nil {
+			log.Log("[kcp] accept stream:", err)
+			return
+		}
+
+		cc := &muxStreamConn{Conn: conn, stream: stream}
+		select {
+		case l.connChan <- cc:
+		default:
+			cc.Close()
+			log.Logf("[kcp] %s - %s: connection queue is full", conn.RemoteAddr(), conn.LocalAddr())
+		}
+	}
+}
+
+func (l *kcpListener) Accept() (conn net.Conn, err error) {
+	var ok bool
+	select {
+	case conn = <-l.connChan:
+	case err, ok = <-l.errChan:
+		if !ok {
+			err = errors.New("accpet on closed listener")
+		}
+	}
+	return
+}
+
+func (l *kcpListener) Addr() net.Addr {
+	return l.ln.Addr()
+}
+
+func (l *kcpListener) Close() error {
+	return l.ln.Close()
+}
+
+//------------mux------------------
+
+type muxStreamConn struct {
+	net.Conn
+	stream *smux.Stream
+}
+
+func (c *muxStreamConn) Read(b []byte) (n int, err error) {
+	return c.stream.Read(b)
+}
+
+func (c *muxStreamConn) Write(b []byte) (n int, err error) {
+	return c.stream.Write(b)
+}
+
+func (c *muxStreamConn) Close() error {
+	return c.stream.Close()
+}
+
+type muxSession struct {
+	conn    net.Conn
+	session *smux.Session
+}
+
+func (session *muxSession) GetConn() (net.Conn, error) {
+	stream, err := session.session.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	return &muxStreamConn{Conn: session.conn, stream: stream}, nil
+}
+
+func (session *muxSession) Accept() (net.Conn, error) {
+	stream, err := session.session.AcceptStream()
+	if err != nil {
+		return nil, err
+	}
+	return &muxStreamConn{Conn: session.conn, stream: stream}, nil
+}
+
+func (session *muxSession) Close() error {
+	if session.session == nil {
+		return nil
+	}
+	return session.session.Close()
+}
+
+func (session *muxSession) IsClosed() bool {
+	if session.session == nil {
+		return true
+	}
+	return session.session.IsClosed()
+}
+
+func (session *muxSession) NumStreams() int {
+	return session.session.NumStreams()
+}

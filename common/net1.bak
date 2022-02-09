@@ -1,0 +1,125 @@
+package common
+
+import (
+	"github.com/xtaci/kcp-go"
+	"github.com/xtaci/smux"
+	"net"
+	"sync"
+
+	log "github.com/liudanking/goutil/logutil"
+)
+
+type KcpListener struct {
+	kcp.Listener
+	chAcceptConn chan *AcceptConn
+}
+
+type AcceptConn struct {
+	conn net.Conn
+	err  error
+}
+
+func NewKcpListener(l kcp.Listener) *KcpListener {
+	ql := &KcpListener{
+		Listener:     l,
+		chAcceptConn: make(chan *AcceptConn, 4), //此处原来是1，新版改为4
+	}
+	go ql.doAccept()
+	return ql
+}
+
+func (ql *KcpListener) doAccept() {
+	for {
+		conn, err := ql.Listener.Accept()
+		if err != nil {
+			log.Error("accept kcp conn failed:%v", err)
+			continue
+		}
+		log.Info("accept a kcp session")
+
+		sess, err := smux.Server(conn, nil)
+
+		if err != nil {
+			log.Error("accept kcp session failed:%v", err)
+			continue
+		}
+		go func(sess *smux.Session) {
+			for {
+				stream, err := sess.AcceptStream()
+				if err != nil {
+					log.Notice("accept kcp stream failed:%v", err)
+					err = sess.Close()
+					return
+				}
+				log.Info("accept stream %v", stream.ID())
+				ql.chAcceptConn <- &AcceptConn{
+					conn: &KcpStream{sess: sess, Stream: stream},
+					err:  nil,
+				}
+			}
+		}(sess)
+	}
+}
+
+func (ql *KcpListener) Accept() (net.Conn, error) {
+	log.Info("KcpListener Accept()")
+	ac := <-ql.chAcceptConn
+	return ac.conn, ac.err
+}
+
+type KcpStream struct {
+	sess *smux.Session
+	*smux.Stream
+}
+
+func (qs *KcpStream) LocalAddr() net.Addr {
+	return qs.sess.LocalAddr()
+}
+
+func (qs *KcpStream) RemoteAddr() net.Addr {
+	return qs.sess.RemoteAddr()
+}
+
+type KcpDialer struct {
+	skipCertVerify bool
+	conn           net.Conn
+	sync.Mutex     //互斥锁
+}
+
+func NewKcpDialer(skipCertVerify bool) *KcpDialer { //此函数的目的就是建立一个新的QuicDialer结构体
+	return &KcpDialer{
+		skipCertVerify: skipCertVerify,
+	}
+}
+
+func (kd *KcpDialer) Dial(network, addr string) (net.Conn, error) {
+	return kcp.DialWithOptions(addr, nil, 10, 3)
+}
+
+func (kd *KcpDialer) Dial1(network, addr string) (net.Conn, error) {
+	kd.Lock()
+	defer kd.Unlock()
+
+	if kd.conn == nil {
+		conn, err := kcp.DialWithOptions(addr, nil, 10, 3)
+		if err != nil {
+			log.Error("dial session failed:%v", err)
+			return nil, err
+		}
+		kd.conn = conn
+	}
+
+	sess, err := smux.Client(kd.conn, nil)
+	if err != nil {
+		log.Info("open kcp session from conn no success:%v, try to open new conn", err)
+		return nil, err
+	}
+	stream, err := sess.OpenStream()
+	if err != nil {
+		log.Info("open kcp stream from session no success:%v, try to open new stream", err)
+		return nil, err
+	}
+
+	log.Info("addr:%s, stream_id:%v", addr, stream.ID())
+	return &KcpStream{sess, stream}, nil
+}
