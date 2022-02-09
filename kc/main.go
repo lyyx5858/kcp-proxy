@@ -78,11 +78,18 @@ func main() {
 		return kcp.DialWithOptions(addr, nil, 10, 3)
 	}
 
-	opts := cmux.DialerOpts{Dial: f1, PoolSize: 10}
+	opts := cmux.DialerOpts{Dial: f1}
 
 	f2 := cmux.Dialer(&opts)
 
-	proxy.Tr.DialContext = f2
+	f4 := func(network, addr string) (net.Conn, error) {
+		ctx := context.Background()
+		return f2(ctx, network, addr)
+	}
+
+	proxy.Tr.Dial = f4
+
+	//proxy.Tr.DialContext = f2
 
 	//proxy.Tr.Dial = func(network, addr string) (net.Conn, error) {
 	//	return kcp.DialWithOptions(addr, nil, 10, 3)
