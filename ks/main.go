@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/getlantern/cmux/v2"
 	"net/http"
 	"os"
 	"runtime"
@@ -58,6 +59,10 @@ func main() {
 
 	listener, err := kcp.ListenWithOptions(listenAddr, nil, 10, 3)
 
+	opts := cmux.ListenOpts{Listener: listener}
+
+	nl := cmux.Listen(&opts)
+
 	if err != nil {
 		log.Error("listen failed:%v", err)
 		return
@@ -70,6 +75,6 @@ func main() {
 	proxy.Verbose = verbose
 	server := &http.Server{Addr: listenAddr, Handler: proxy}
 	log.Info("start serving %v", listenAddr)
-	log.Error("serve error:%v", server.Serve(listener))
+	log.Error("serve error:%v", server.Serve(nl))
 
 }

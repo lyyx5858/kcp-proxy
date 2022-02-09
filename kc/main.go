@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"github.com/getlantern/cmux/v2"
 	"github.com/xtaci/kcp-go/v5"
 	"net"
 	"net/http"
@@ -70,10 +72,21 @@ func main() {
 	proxy.Tr.Proxy = func(req *http.Request) (*url.URL, error) {
 		return url.Parse(proxyUrl)
 	}
+	var f1 cmux.DialFN
 
-	proxy.Tr.Dial = func(network, addr string) (net.Conn, error) {
+	f1 = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return kcp.DialWithOptions(addr, nil, 10, 3)
 	}
+
+	opts := cmux.DialerOpts{Dial: f1, PoolSize: 10}
+
+	f2 := cmux.Dialer(&opts)
+
+	proxy.Tr.DialContext = f2
+
+	//proxy.Tr.Dial = func(network, addr string) (net.Conn, error) {
+	//	return kcp.DialWithOptions(addr, nil, 10, 3)
+	//}
 
 	//proxy.Tr.Dial = dialer.Dial //proxy.Tr.Dial 是个在net.Transport结构中定义的一个Func变量，这句话等于用一个Dialer下的Dial方法
 	//给其赋值。因为它们两的签名一致。
